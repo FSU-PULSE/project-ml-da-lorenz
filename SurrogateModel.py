@@ -14,6 +14,13 @@ _ACTIVATION_MAP = {
 }
 
 
+def _is_cupy_array(obj):
+    """True for CuPy ndarrays (not PyTorch tensors)."""
+    if isinstance(obj, torch.Tensor):
+        return False
+    return type(obj).__module__.startswith('cupy')
+
+
 class SurrogateModel:
     """
     Generic loader and predictor for any pretrained Lorenz surrogate model.
@@ -83,6 +90,8 @@ class SurrogateModel:
         self.model.to(self.device)
         self.model.eval()
         self._hidden = None  # recurrent hidden state (LSTMNN/RNN only)
+        self._train_mean_t = None
+        self._train_std_t = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -184,13 +193,12 @@ class SurrogateModel:
         -------
         np.ndarray of shape ``(B, N)``.
         """
-        window = self._prepare_batch(state_histories)  # (B, prev_time_steps, N) normalised, on device
+        window = self._prepare_batch_tensor(state_histories)
 
         with torch.inference_mode():
             pred_norm, _ = self._forward_normalized(window, hidden=None)
 
-        pred = pred_norm.cpu().numpy().astype(np.float64)
-        return pred * self.train_std + self.train_mean
+        return self._denorm_tensor(pred_norm).cpu().numpy().astype(np.float64)
 
     def batch_rollout(self, state_histories, num_steps):
         """
@@ -220,8 +228,34 @@ class SurrogateModel:
         """
         if num_steps <= 0:
             raise ValueError(f"num_steps must be positive, got {num_steps}")
+        out = self.batch_rollout_tensor(state_histories, num_steps)
+        return out.detach().cpu().numpy().astype(np.float64)
 
-        window = self._prepare_batch(state_histories)  # (B, prev_time_steps, N) normalised
+    def batch_rollout_tensor(self, state_histories, num_steps):
+        """
+        Batched autoregressive rollout; returns a GPU ``torch.Tensor`` in physical space.
+
+        Same semantics as :meth:`batch_rollout`, but the result stays on
+        ``self.device`` for zero-copy handoff to CuPy via DLPack.
+        """
+        if num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
+        out_norm = self._batch_rollout_normalized_tensor(state_histories, num_steps)
+        return self._denorm_tensor(out_norm)
+
+    def batch_rollout_cupy(self, state_histories, num_steps):
+        """
+        Batched rollout returning a CuPy array on the default CUDA device (DLPack bridge).
+        """
+        import cupy as cp
+        out = self.batch_rollout_tensor(state_histories, num_steps)
+        if not out.is_cuda:
+            raise RuntimeError("batch_rollout_cupy requires a CUDA SurrogateModel device.")
+        return cp.from_dlpack(torch.utils.dlpack.to_dlpack(out.contiguous()))
+
+    def _batch_rollout_normalized_tensor(self, state_histories, num_steps):
+        """Rollout in normalised space; returns ``(B, num_steps, N)`` on device."""
+        window = self._prepare_batch_tensor(state_histories)
         hidden = None
         preds = []
 
@@ -229,47 +263,105 @@ class SurrogateModel:
             for _ in range(num_steps):
                 pred_norm, hidden = self._forward_normalized(window, hidden=hidden)
                 preds.append(pred_norm)
-                # Roll: drop oldest step, append new prediction (still normalised)
                 window = torch.cat([window[:, 1:, :], pred_norm.unsqueeze(1)], dim=1)
 
-        out_norm = torch.stack(preds, dim=1)  # (B, num_steps, N)
-        out = out_norm.cpu().numpy().astype(np.float64)
-        return out * self.train_std + self.train_mean
+        return torch.stack(preds, dim=1)
 
     def _prepare_batch(self, state_histories):
+        """Alias for :meth:`_prepare_batch_tensor` (backward compatibility)."""
+        return self._prepare_batch_tensor(state_histories)
+
+    def _prepare_batch_tensor(self, state_histories):
         """
         Validate, reshape, normalise, and move a batch of histories to device.
 
-        Returns a tensor of shape ``(B, prev_time_steps, N)`` in normalised
-        space, with the model's parameter dtype.
+        Accepts NumPy (host), ``torch.Tensor``, or CuPy (GPU) arrays in **physical**
+        space. Returns a tensor of shape ``(B, prev_time_steps, N)`` in normalised
+        space on ``self.device``.
         """
-        arr = np.asarray(state_histories, dtype=np.float64)
-        if arr.ndim == 2:
-            # (B, prev_time_steps * N) — reshape
-            if arr.shape[1] != self.prev_time_steps * self.input_size:
+        if isinstance(state_histories, torch.Tensor):
+            arr_t = self._coerce_batch_tensor(state_histories)
+        elif _is_cupy_array(state_histories):
+            dtype = next(self.model.parameters()).dtype
+            arr_t = torch.as_tensor(
+                state_histories, device=self.device, dtype=dtype)
+            arr_t = self._coerce_batch_tensor(arr_t)
+        else:
+            arr = np.asarray(state_histories, dtype=np.float64)
+            batch_shape = self._parse_batch_shape(arr.shape, arr.ndim)
+            if batch_shape[0] < 1:
+                raise ValueError("Batch size B must be >= 1.")
+            if arr.ndim == 2:
+                arr = arr.reshape(batch_shape[0], self.prev_time_steps, self.input_size)
+            dtype = next(self.model.parameters()).dtype
+            arr_t = torch.as_tensor(arr, dtype=dtype, device=self.device)
+        mean, std = self._norm_stats_tensors()
+        return (arr_t - mean) / std
+
+    def _coerce_batch_tensor(self, arr_t):
+        """Reshape / validate a batch tensor already on device (physical space)."""
+        if arr_t.device != self.device:
+            arr_t = arr_t.to(self.device)
+        dtype = next(self.model.parameters()).dtype
+        if arr_t.dtype != dtype:
+            arr_t = arr_t.to(dtype=dtype)
+        if arr_t.ndim == 2:
+            expected = self.prev_time_steps * self.input_size
+            if arr_t.shape[1] != expected:
                 raise ValueError(
-                    f"Flat batch must have shape (B, {self.prev_time_steps * self.input_size}), "
-                    f"got {arr.shape}."
+                    f"Flat batch must have shape (B, {expected}), got {arr_t.shape}."
                 )
-            arr = arr.reshape(arr.shape[0], self.prev_time_steps, self.input_size)
-        elif arr.ndim == 3:
-            if arr.shape[1] != self.prev_time_steps or arr.shape[2] != self.input_size:
+            arr_t = arr_t.reshape(arr_t.shape[0], self.prev_time_steps, self.input_size)
+        elif arr_t.ndim == 3:
+            if (arr_t.shape[1] != self.prev_time_steps
+                    or arr_t.shape[2] != self.input_size):
                 raise ValueError(
                     f"Batch must have shape (B, {self.prev_time_steps}, {self.input_size}), "
-                    f"got {arr.shape}."
+                    f"got {arr_t.shape}."
                 )
         else:
             raise ValueError(
-                f"state_histories must be 2D (B, prev_time_steps * N) or "
-                f"3D (B, prev_time_steps, N); got ndim={arr.ndim}."
+                f"state_histories must be 2D or 3D; got ndim={arr_t.ndim}."
             )
-
-        if arr.shape[0] < 1:
+        if arr_t.shape[0] < 1:
             raise ValueError("Batch size B must be >= 1.")
+        return arr_t
 
-        normalised = (arr - self.train_mean) / self.train_std
-        dtype = next(self.model.parameters()).dtype
-        return torch.as_tensor(normalised, dtype=dtype, device=self.device)
+    def _parse_batch_shape(self, shape, ndim):
+        """Validate NumPy batch shape; return ``(B, prev_time_steps, N)`` dimensions."""
+        if ndim == 2:
+            if shape[1] != self.prev_time_steps * self.input_size:
+                raise ValueError(
+                    f"Flat batch must have shape (B, {self.prev_time_steps * self.input_size}), "
+                    f"got {shape}."
+                )
+            return (shape[0], self.prev_time_steps, self.input_size)
+        if ndim == 3:
+            if shape[1] != self.prev_time_steps or shape[2] != self.input_size:
+                raise ValueError(
+                    f"Batch must have shape (B, {self.prev_time_steps}, {self.input_size}), "
+                    f"got {shape}."
+                )
+            return shape
+        raise ValueError(
+            f"state_histories must be 2D (B, prev_time_steps * N) or "
+            f"3D (B, prev_time_steps, N); got ndim={ndim}."
+        )
+
+    def _norm_stats_tensors(self):
+        """Lazy device tensors for train_mean / train_std."""
+        if self._train_mean_t is None:
+            dtype = next(self.model.parameters()).dtype
+            self._train_mean_t = torch.as_tensor(
+                self.train_mean, dtype=dtype, device=self.device)
+            self._train_std_t = torch.as_tensor(
+                self.train_std, dtype=dtype, device=self.device)
+        return self._train_mean_t, self._train_std_t
+
+    def _denorm_tensor(self, x_norm):
+        """Map normalised tensor(s) to physical space on device."""
+        mean, std = self._norm_stats_tensors()
+        return x_norm * std + mean
 
     def _forward_normalized(self, window, hidden):
         """

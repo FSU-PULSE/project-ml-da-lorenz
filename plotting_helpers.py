@@ -253,7 +253,7 @@ def plot_ensemble_spaghetti(res, name, palette, cfg, cycle_range=None, var_indic
 
             # Truth
             ax.plot(t_local, truth_traj[k, :, v],
-                    color='black', linewidth=1.2, alpha=0.9)
+                    color='blue', linewidth=2.0, alpha=0.9)
 
             # Mark analysis time (start of each forecast window)
             ax.axvline(t_offset, color='gray', linewidth=0.4, alpha=0.4, linestyle=':')
@@ -314,7 +314,7 @@ def plot_ensemble_spaghetti_multi(results, palette, cfg, cycle_range=None, var_i
             ens_mean = np.mean(ens_traj[k, :, :, var_idx], axis=0)
             ax.plot(t_local, ens_mean, color="red", linewidth=2.0, alpha=0.8)
             ax.plot(t_local, truth_traj[k, :, var_idx],
-                    color='black', linewidth=1.0, alpha=0.9)
+                    color='blue', linewidth=2.0, alpha=0.9)
             ax.axvline(t_offset, color='gray', linewidth=0.3, alpha=0.3, linestyle=':')
 
         ax.set_ylabel(name, fontsize=10, fontweight='bold')

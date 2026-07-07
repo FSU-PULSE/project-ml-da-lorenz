@@ -114,9 +114,17 @@ def load_enkf_results_hdf5(path: str | Path) -> dict[str, Any]:
 def summarize_cycles(
     store_or_path: EnKFResultsStore | str | Path,
     metrics: tuple[str, ...] = ('errorf', 'errora', 'errorf_es', 'errora_es'),
+    cycle_start: int = 0,
+    cycle_stop: int | None = None,
 ) -> 'pd.DataFrame':
-    """Long-format summary: one row per (ic_index, model) with mean/std per metric."""
+    """Long-format summary: one row per (ic_index, model) with mean/std per metric.
+
+    Means and stds are computed over cycles ``cycle_start:cycle_stop`` only
+    (default: all cycles).
+    """
     import pandas as pd
+
+    cycle_slice = slice(cycle_start, cycle_stop)
 
     if isinstance(store_or_path, EnKFResultsStore):
         ic_index = store_or_path.ic_index
@@ -148,8 +156,151 @@ def summarize_cycles(
                 'diverged': bool(m['diverged'][iic]),
             }
             for metric in metrics:
-                vals = m[metric][iic]
+                vals = m[metric][iic][cycle_slice]
                 row[f'{metric}_mean'] = float(np.nanmean(vals))
                 row[f'{metric}_std'] = float(np.nanstd(vals))
             rows.append(row)
     return pd.DataFrame(rows)
+
+
+SUMMARY_TABLE_METRICS = ('errorf', 'errora', 'errorf_es', 'errora_es', 'spread')
+
+
+def _mu_sigma_str(values: np.ndarray, decimals: int = 4) -> str:
+    """Format nan-aware mean ± std for markdown table cells."""
+    mu = float(np.nanmean(values))
+    sigma = float(np.nanstd(values))
+    fmt = f'{{:.{decimals}f}}'
+    return f'{fmt.format(mu)} ± {fmt.format(sigma)}'
+
+
+def per_ic_delta_es_pct(es_f: np.ndarray, es_a: np.ndarray) -> np.ndarray:
+    """Relative ES improvement from assimilation (%), per IC."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return (es_f - es_a) / es_f * 100.0
+
+
+SUMMARY_TABLE_FORMATS = ('md', 'csv')
+
+
+def build_summary_table(
+    df: 'pd.DataFrame',
+    *,
+    model_order: list[str] | None = None,
+) -> 'pd.DataFrame':
+    """Aggregate per-model μ and σ across ICs (numeric columns)."""
+    import pandas as pd
+
+    required = {
+        'model',
+        'errorf_mean',
+        'errora_mean',
+        'errorf_es_mean',
+        'errora_es_mean',
+        'spread_mean',
+    }
+    missing = required - set(df.columns)
+    if missing:
+        raise KeyError(f'summary table missing columns: {sorted(missing)}')
+
+    models = model_order or sorted(df['model'].unique())
+    models = [m for m in models if m in df['model'].values]
+
+    rows = []
+    for model in models:
+        sub = df.loc[df['model'] == model]
+        delta_es = per_ic_delta_es_pct(
+            sub['errorf_es_mean'].to_numpy(),
+            sub['errora_es_mean'].to_numpy(),
+        )
+        rows.append({
+            'Method': model,
+            'RMSE_f_mean': float(np.nanmean(sub['errorf_mean'])),
+            'RMSE_f_std': float(np.nanstd(sub['errorf_mean'])),
+            'RMSE_a_mean': float(np.nanmean(sub['errora_mean'])),
+            'RMSE_a_std': float(np.nanstd(sub['errora_mean'])),
+            'ES_f_mean': float(np.nanmean(sub['errorf_es_mean'])),
+            'ES_f_std': float(np.nanstd(sub['errorf_es_mean'])),
+            'ES_a_mean': float(np.nanmean(sub['errora_es_mean'])),
+            'ES_a_std': float(np.nanstd(sub['errora_es_mean'])),
+            'Spread_mean': float(np.nanmean(sub['spread_mean'])),
+            'Spread_std': float(np.nanstd(sub['spread_mean'])),
+            'delta_ES_pct_mean': float(np.nanmean(delta_es)),
+            'delta_ES_pct_std': float(np.nanstd(delta_es)),
+        })
+    return pd.DataFrame(rows)
+
+
+def _format_agg_mu_sigma(mu: float, sigma: float, decimals: int) -> str:
+    fmt = f'{{:.{decimals}f}}'
+    return f'{fmt.format(mu)} ± {fmt.format(sigma)}'
+
+
+def write_summary_table(
+    df: 'pd.DataFrame',
+    path: str | Path,
+    *,
+    fmt: str = 'csv',
+    model_order: list[str] | None = None,
+    decimals: int = 4,
+    title: str = 'EnKF summary scalars',
+    notes: list[str] | None = None,
+) -> Path:
+    """Write μ ± σ summary table (one row per model) to markdown or CSV."""
+    import pandas as pd
+
+    fmt = fmt.lower()
+    if fmt not in SUMMARY_TABLE_FORMATS:
+        raise ValueError(f"fmt must be one of {SUMMARY_TABLE_FORMATS}, got {fmt!r}")
+
+    path = Path(path)
+    if path.suffix.lower() not in ('.md', '.csv'):
+        path = path.with_suffix(f'.{fmt}')
+
+    numeric_df = build_summary_table(df, model_order=model_order)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    if fmt == 'csv':
+        numeric_df.to_csv(path, index=False, float_format=f'%.{decimals}f')
+        return path
+
+    pairs = [
+        ('RMSEᶠ', 'RMSE_f_mean', 'RMSE_f_std'),
+        ('RMSEᵃ', 'RMSE_a_mean', 'RMSE_a_std'),
+        ('ESᶠ', 'ES_f_mean', 'ES_f_std'),
+        ('ESᵃ', 'ES_a_mean', 'ES_a_std'),
+        ('Spread', 'Spread_mean', 'Spread_std'),
+        ('ΔES%', 'delta_ES_pct_mean', 'delta_ES_pct_std'),
+    ]
+    display_df = pd.DataFrame({'Method': numeric_df['Method']})
+    for label, mu_col, sig_col in pairs:
+        display_df[label] = [
+            _format_agg_mu_sigma(m, s, decimals)
+            for m, s in zip(numeric_df[mu_col], numeric_df[sig_col])
+        ]
+
+    lines = [
+        f'# {title}',
+        '',
+        '| Method | RMSEᶠ | RMSEᵃ | ESᶠ | ESᵃ | Spread | ΔES% |',
+        '|--------|-------|-------|-----|-----|--------|------|',
+    ]
+    for _, row in display_df.iterrows():
+        lines.append(
+            '| {Method} | {RMSEᶠ} | {RMSEᵃ} | {ESᶠ} | {ESᵃ} | {Spread} | {ΔES%} |'.format(
+                **row.to_dict()
+            )
+        )
+    if notes:
+        lines.extend(['', *notes])
+    path.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return path
+
+
+def write_summary_table_md(
+    df: 'pd.DataFrame',
+    path: str | Path,
+    **kwargs: Any,
+) -> Path:
+    """Backward-compatible alias for ``write_summary_table(..., fmt='md')``."""
+    return write_summary_table(df, path, fmt='md', **kwargs)

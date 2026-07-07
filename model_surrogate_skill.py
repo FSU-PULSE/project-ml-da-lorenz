@@ -213,9 +213,11 @@ ax.semilogy(lyapunov_times, rmse_rnn_tanh,  label='RNN_tanh',  color=surrogates_
 
 ax.axhline(clim_rmse, ls='--', color='gray', lw=0.8, label=f'Climatology {clim_rmse:.2f}')
 
-# Mark your DA obs frequency (every 8 steps = 0.08 tu = 0.073 LT)
-ax.axvline(10 * 0.01 * 0.906, ls=':', color='black', lw=0.8, 
-           label='Obs interval (10 steps)')
+# Training rollout interval (every 8 steps = 0.08 tu = 0.073 LT)
+ax.axvline(5 * 0.01 * 0.906, ls=':', color='black', lw=0.8, 
+           label='Rollout interval (5 steps)')
+ax.axvline(20 * 0.01 * 0.906, ls=':', color='black', lw=0.8, 
+           label='Rollout interval (20 steps)')
 
 ax.set_xlabel('Lyapunov times')
 ax.set_ylabel('RMSE (log scale)')

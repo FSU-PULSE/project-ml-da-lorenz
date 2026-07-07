@@ -18,6 +18,12 @@ pip install -r requirements.txt
 
 For GPU training, `torch` in `requirements.txt` is CPU-only by default — replace with the appropriate CUDA wheel.
 
+For GPU particle-filter benchmarks (`D_PF_cupy`), also install CuPy matched to your CUDA build:
+
+```bash
+pip install -r requirements-gpu.txt   # e.g. cupy-cuda12x
+```
+
 ## Commands
 
 ```bash
@@ -40,6 +46,12 @@ python ML_Model_Comparison.py
 # EnKF DA benchmarks (surrogate vs. truth); outputs go to figures/
 python D_EnKF.py
 
+# Particle Filter DA benchmarks (NumPy); outputs go to figures/
+python D_PF.py
+
+# Particle Filter DA benchmarks (CuPy / GPU surrogates); requires CUDA + cupy
+python D_PF_cupy.py
+
 # TensorBoard (logs written to runs/)
 tensorboard --logdir runs/
 
@@ -59,6 +71,8 @@ pytest tests/test_lorenz_systems.py::test_generate_trajectory_l63   # single tes
 | `Main_ML.py` | CLI — batch training from `config.yml` |
 | `ML_Model_Comparison.py` | CLI — evaluate and compare saved models |
 | `D_EnKF.py` | Script — full EnKF DA experiments with surrogate vs. truth |
+| `D_PF.py` | Script — bootstrap PF benchmarks (NumPy); mirrors `D_EnKF` setup for head-to-head comparisons |
+| `D_PF_cupy.py` | Script — same PF benchmarks with CuPy on-device state and GPU surrogate rollouts |
 
 ### Core Modules
 
@@ -98,7 +112,13 @@ pytest tests/test_lorenz_systems.py::test_generate_trajectory_l63   # single tes
 - Loads any checkpoint, reconstructs architecture from metadata
 - Handles normalization/denormalization internally; users always work in physical space
 - `predict(history)` → next state `(N,)`; `rollout(history, n_steps)` → `(n_steps, N)`; calling the object (`surrogate(history)`) aliases `predict`
+- `batch_rollout` / `batch_rollout_tensor` / `batch_rollout_cupy` — batched autoregressive rollout; tensor/cupy variants keep results on GPU (DLPack bridge for CuPy)
 - Auto-discovers `.yml` sidecar next to `.pth` for full config reconstruction
+
+**`PF_core.py`** / **`PF_core_cupy.py`** — Bootstrap particle filter (shared `PFConfig` from `PF_core`):
+- `run_pf` / `run_pf_cupy` — full DA cycle; CuPy version returns NumPy dicts for plotting. Filter RNG, systematic resampling, and jitter use the same NumPy helpers as `run_pf` (`filter_seed` matches); particle linear algebra stays on GPU.
+- `make_surrogate_forecaster(_gpu)` / `make_lorenz_forecaster(_gpu)` — forecast callables for ensemble layout `(Nx, Ne)`
+- Truth integration always uses CPU DAPyr; `obs_seed` observations are CPU NumPy in both variants
 
 **`EnKF_core.py`** — Core EnKF logic (imported by `D_EnKF.py`):
 - `EnKFConfig` — dataclass for all tunable parameters
