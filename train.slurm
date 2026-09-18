@@ -8,6 +8,7 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=jvelasco@coaps.fsu.edu
 #SBATCH --partition=class
+#SBATCH --exclude=class101,class102,class105,class106,class107,class108,class109,class110,class111,class112
 
 # Path to my conda manager
 source /home/jv24b/miniconda3/etc/profile.d/conda.sh

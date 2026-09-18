@@ -171,6 +171,10 @@ results/
 logs/
 working_models.md
 *.txt
+models_bak/
+dense*step_config.yml
+resdense*step_config.yml
+*roll*_config.yml
 
 
 # PyCharm
